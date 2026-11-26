@@ -52,7 +52,7 @@ from listings import (
 VERSION = "1.0"
 USER_AGENT = (
     f"job-listings-scraper/{VERSION} "
-    "(+https://github.com/Macho-Gaspacho/job-listings-scraper)"
+    "(+https://github.com/maratgasparian/job-listings-scraper)"
 )
 
 # The public all-jobs feed. Checked once: it returns RSS (HTTP 200).

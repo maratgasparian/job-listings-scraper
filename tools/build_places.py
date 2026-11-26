@@ -24,7 +24,7 @@ COUNTRIES = ROOT / "geodata" / "countries.yaml"
 MIN_POPULATION = 50000
 USER_AGENT = (
     "job-listings-scraper/1.0 "
-    "(+https://github.com/Macho-Gaspacho/job-listings-scraper)"
+    "(+https://github.com/maratgasparian/job-listings-scraper)"
 )
 # Latin (including extensions) and Cyrillic, plus space, apostrophe, dot, hyphen.
 _ALIAS = re.compile(r"^[A-Za-zÀ-ɏЀ-ӿ .'\-]+$")

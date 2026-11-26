@@ -1,6 +1,6 @@
 # Job listings scraper
 
-[![Tests](https://github.com/Macho-Gaspacho/job-listings-scraper/actions/workflows/tests.yml/badge.svg)](https://github.com/Macho-Gaspacho/job-listings-scraper/actions/workflows/tests.yml)
+[![Tests](https://github.com/maratgasparian/job-listings-scraper/actions/workflows/tests.yml/badge.svg)](https://github.com/maratgasparian/job-listings-scraper/actions/workflows/tests.yml)
 [![Python 3.10 | 3.12 | 3.13](https://img.shields.io/badge/python-3.10%20%7C%203.12%20%7C%203.13-blue)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
@@ -62,12 +62,12 @@ Download it from [python.org/downloads](https://www.python.org/downloads/).
 
 ### Step 2. Download this project
 
-Open [github.com/Macho-Gaspacho/job-listings-scraper](https://github.com/Macho-Gaspacho/job-listings-scraper). Click the green **Code** button, then **Download ZIP**. Unzip the file. You get a folder named `job-listings-scraper`.
+Open [github.com/maratgasparian/job-listings-scraper](https://github.com/maratgasparian/job-listings-scraper). Click the green **Code** button, then **Download ZIP**. Unzip the file. You get a folder named `job-listings-scraper`.
 
 If you already use Git, this is the same thing:
 
 ```bash
-git clone https://github.com/Macho-Gaspacho/job-listings-scraper.git
+git clone https://github.com/maratgasparian/job-listings-scraper.git
 ```
 
 ### Step 3. Start the program
