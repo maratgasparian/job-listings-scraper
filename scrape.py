@@ -48,14 +48,29 @@ try:
         apply_new_flags,
         dedupe,
         fit_group,
-        identity_keys,
         sort_rows,
         title_is_excluded,
         title_is_relevant,
     )
-    from regions import _country_in_text
+    from regions import (
+        _EXTRA_REGIONS,
+        _country_in_text,
+        _generic_remote,
+        build_location_rules,
+        contains_phrase,
+        excluded_region,
+        is_home_region,
+        matches_remote_region,
+    )
     from link_outs import links_for_settings
-    from save_results import announce_links, load_seen, save_seen, write_daily_files, write_outputs
+    from save_results import (
+        announce_links,
+        load_seen_memory,
+        note_source_attempt,
+        save_seen_memory,
+        write_daily_files,
+        write_outputs,
+    )
     from sources import fetch_listings, quiet_library_logs
 except ModuleNotFoundError as exc:
     if __name__ == "__main__":
@@ -141,7 +156,69 @@ def _other_country(location: str, country: str) -> bool:
     return bool(found) and found != country
 
 
-def collect_listings(settings: Settings, fetch, pause=time.sleep) -> tuple[list[dict], int]:
+def _remote_country(place, settings) -> str:
+    """The country a remote search is for. The place wins, then the config."""
+    named = str(getattr(place, "country", None) or "").strip()
+    if named:
+        return named.casefold()
+    found = _place_country(place)
+    if found:
+        return found
+    return str(getattr(settings, "country", None) or "").casefold()
+
+
+def _rules_for_remote(settings, place):
+    """Location rules for a remote aggregator search. None when no country is known."""
+    rules = getattr(settings, "location_rules", None)
+    if rules is not None:
+        return rules
+    country = _remote_country(place, settings)
+    if not country:
+        return None
+    places = getattr(settings, "places", None) or [place]
+    return build_location_rules(places, country, None)
+
+
+def _names_other_region(location: str, rules) -> bool:
+    """True when the text names a region this user did not ask for.
+
+    "Europe" matches an EU search. "Worldwide" and a bare "Remote" do not
+    name somewhere else. "Asia" does, unless that region was configured.
+    """
+    if matches_remote_region(location, rules) or _generic_remote(location, True):
+        return False
+    for label in _EXTRA_REGIONS:
+        if contains_phrase(label, location) and not is_home_region(label, rules):
+            return True
+    return False
+
+
+def _outside_aggregator(location: str, place, settings, rules) -> bool:
+    """True when an Indeed or LinkedIn row is tied to somewhere else.
+
+    An office search drops another country. A remote search does too, and
+    it also drops a region the user did not include. A bare "Remote", the
+    searched country, and an open region such as Europe or Worldwide stay.
+    """
+    text = str(location or "")
+    if not getattr(place, "remote", False):
+        return _other_country(text, _place_country(place))
+    country = _remote_country(place, settings)
+    if rules is not None and excluded_region(text, rules):
+        return True
+    if _other_country(text, country):
+        return True
+    if rules is not None and _names_other_region(text, rules):
+        return True
+    return False
+
+
+def collect_listings(
+    settings: Settings,
+    fetch,
+    pause=time.sleep,
+    failure_log: dict | None = None,
+) -> tuple[list[dict], int]:
     """Search every role, place, and site.
 
     `fetch(role, place, site)` returns rows, or raises if that one search
@@ -157,9 +234,11 @@ def collect_listings(settings: Settings, fetch, pause=time.sleep) -> tuple[list[
             found = fetch(role, place, site)
         except Exception as exc:
             failures += 1
+            note_source_attempt(failure_log, site, failed=True)
             report_skip(exc)
             found = []
         else:
+            note_source_attempt(failure_log, site, failed=False)
             phrases = (settings.title_keywords or {}).get(role, [])
             excludes = settings.exclude_keywords or []
             # Job sites return loosely related titles. When the config lists
@@ -183,15 +262,16 @@ def collect_listings(settings: Settings, fetch, pause=time.sleep) -> tuple[list[
             # Indeed and LinkedIn are not checked by the company-page rules.
             # A row that names another country, or ends in a US state code
             # while this place is not in the US, does not belong in the file.
-            if not place.remote:
-                country = _place_country(place)
-                kept = []
-                for row in found:
-                    if _other_country(str(row.get("location") or ""), country):
-                        dropped_country += 1
-                    else:
-                        kept.append(row)
-                found = kept
+            # A remote search uses the same country check, and also drops a
+            # region the user did not ask for. "Remote" and "Worldwide" stay.
+            rules = _rules_for_remote(settings, place) if place.remote else None
+            kept = []
+            for row in found:
+                if _outside_aggregator(str(row.get("location") or ""), place, settings, rules):
+                    dropped_country += 1
+                else:
+                    kept.append(row)
+            found = kept
             if filtered or dropped_country:
                 if filtered:
                     reason = "after filters" if limited else "with a matching title"
@@ -242,7 +322,8 @@ def _run_search(
         print(f"Could not read the config file: {exc}")
         return 1
 
-    seen = load_seen(settings.seen_file)
+    seen = load_seen_memory(settings.seen_file)
+    failure_log: dict[str, dict[str, int]] = {}
     # A stand-in getter means this run is a test or an offline replay.
     # The live search still waits between requests.
     def _no_pause(_seconds: float) -> None:
@@ -250,10 +331,12 @@ def _run_search(
 
     with bind_candidate(settings.candidate):
         if getter is None:
-            board_rows, board_failures = collect_board_listings(settings)
+            board_rows, board_failures = collect_board_listings(
+                settings, failure_log=failure_log
+            )
         else:
             board_rows, board_failures = collect_board_listings(
-                settings, pause=_no_pause, getter=getter
+                settings, pause=_no_pause, getter=getter, failure_log=failure_log
             )
         aggregator_rows: list[dict] = []
         aggregator_failures = 0
@@ -268,10 +351,13 @@ def _run_search(
                 settings,
                 run_fetch,
                 pause=time.sleep if getter is None else _no_pause,
+                failure_log=failure_log,
             )
     # Dedupe again across company pages, remote boards, and Indeed/LinkedIn.
+    # The clock in config.yaml, or the computer's own timezone when that is blank.
+    run_at = _clock_now(settings.timezone)
     rows = dedupe(board_rows + aggregator_rows)
-    rows = sort_rows(apply_new_flags(rows, seen))
+    rows = sort_rows(apply_new_flags(rows, seen, today=run_at.date()))
     rows = hide_poor_fits(rows, settings.candidate)
     failures = board_failures + aggregator_failures
     searches = len(_search_pairs(settings))
@@ -291,18 +377,17 @@ def _run_search(
         settings.excel_path,
         place_names=[place.name for place in settings.places],
     )
-    remembered = set(seen)
-    for row in rows:
-        remembered |= identity_keys(row)
-    save_seen(settings.seen_file, remembered)
+    seen.remember(rows, run_at.date())
+    save_seen_memory(settings.seen_file, seen)
 
-    # The clock in config.yaml, or the computer's own timezone when that is blank.
-    run_at = _clock_now(settings.timezone)
     new_csv = settings.output_dir / "new_jobs.csv"
     last_run = settings.output_dir / "last_run.json"
-    summary = write_daily_files(rows, new_csv, last_run, run_at)
+    summary = write_daily_files(rows, new_csv, last_run, run_at, failure_log)
     print()
     print(f"Saved {len(rows)} listings ({summary['new_listings']} new).")
+    failed = (summary.get("failures") or {}).get("total") or 0
+    if failed:
+        print(f"Failed searches: {failed}. Details are in {last_run}.")
     print(f"Excel: {excel_path}")
     print(f"CSV:   {settings.csv_path}")
     announce_links(links_for_settings(settings))

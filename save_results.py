@@ -5,7 +5,7 @@ from __future__ import annotations
 import csv
 import json
 import os
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -13,8 +13,11 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-from listings import OUTPUT_FIELDS
+from listings import OUTPUT_FIELDS, identity_keys, source_names
 
+
+# A job that has not been seen for this many days can be new again.
+SEEN_TTL_DAYS = 90
 
 # A quiet green so the "yes" cells are easy to spot in Excel.
 NEW_FILL = PatternFill("solid", fgColor="CDE9D6")
@@ -84,18 +87,142 @@ COLUMN_WIDTHS = {
 }
 
 
-def load_seen(path: str | Path) -> set[str]:
-    """Links saved by earlier runs. A missing file means "nothing yet".
+class SeenMemory:
+    """Keys saved by earlier runs, with the day they were last seen.
+
+    ``seen_keys`` in the file is the list of keys. ``seen_on`` and
+    ``seen_sources`` are optional, so an older file still loads. A key
+    with no date uses the file's modification time. A key older than
+    SEEN_TTL_DAYS is forgotten. A role key with no recorded sources still
+    counts for every site, which is how older files behaved.
+    """
+
+    def __init__(self, entries: dict[str, dict] | None = None) -> None:
+        self.entries = entries or {}
+
+    def active_keys(self, today: date) -> set[str]:
+        return {key for key in self.entries if self._fresh(key, today)}
+
+    def _fresh(self, key: str, today: date) -> bool:
+        entry = self.entries.get(key)
+        if not entry:
+            return False
+        age = _seen_age_days(entry.get("seen_on"), today)
+        if age is None:
+            return True
+        return age <= SEEN_TTL_DAYS
+
+    def _sources(self, key: str) -> set[str]:
+        entry = self.entries.get(key) or {}
+        return {str(item) for item in entry.get("sources") or []}
+
+    def prune(self, today: date) -> None:
+        stale = [key for key in self.entries if not self._fresh(key, today)]
+        for key in stale:
+            del self.entries[key]
+
+    def remember(self, rows: list[dict], today: date) -> None:
+        """Refresh keys from this run and drop ones that have expired."""
+        self.prune(today)
+        for row in rows:
+            sources = sorted(source_names(row))
+            for key in identity_keys(row):
+                entry = self.entries.get(key)
+                if entry is None:
+                    self.entries[key] = {"seen_on": today.isoformat(), "sources": sources}
+                    continue
+                entry["seen_on"] = today.isoformat()
+                merged = set(entry.get("sources") or [])
+                merged.update(sources)
+                entry["sources"] = sorted(merged)
+
+    def row_was_seen(self, row: dict, today: date | None = None) -> bool:
+        """True when this posting was saved recently.
+
+        The same link is not new. The same title and company from another
+        site is not new. A different link on a site that already listed
+        that title is still new.
+        """
+        current = today or date.today()
+        keys = identity_keys(row)
+        urls = [key for key in keys if str(key).startswith("url:")]
+        if any(self._fresh(key, current) for key in urls):
+            return True
+        sources = source_names(row)
+        for key in keys:
+            if str(key).startswith("url:"):
+                continue
+            if not self._fresh(key, current):
+                continue
+            known = self._sources(key)
+            # No link, an older file with no sources, or a source we have
+            # not recorded yet: the title and company were already saved.
+            if not urls or not known or not sources or not (sources <= known):
+                return True
+        return False
+
+
+def _seen_age_days(seen_on: object, today: date) -> int | None:
+    if not isinstance(seen_on, str) or not seen_on.strip():
+        return None
+    try:
+        stamped = date.fromisoformat(seen_on.strip()[:10])
+    except ValueError:
+        return None
+    return (today - stamped).days
+
+
+def _memory_from_data(data: object, file_path: Path) -> SeenMemory:
+    keys = _seen_keys(data)
+    dated = data.get("seen_on") if isinstance(data, dict) else None
+    sourced = data.get("seen_sources") if isinstance(data, dict) else None
+    if not isinstance(dated, dict):
+        dated = {}
+    if not isinstance(sourced, dict):
+        sourced = {}
+    fallback = datetime.fromtimestamp(file_path.stat().st_mtime).date().isoformat()
+    entries: dict[str, dict] = {}
+    for key in keys:
+        raw_date = dated.get(key)
+        if isinstance(raw_date, str) and raw_date.strip():
+            seen_on = raw_date.strip()[:10]
+        else:
+            seen_on = fallback
+        raw_sources = sourced.get(key)
+        sources: list[str] = []
+        if isinstance(raw_sources, list):
+            sources = sorted(
+                {str(item).strip().casefold() for item in raw_sources if str(item).strip()}
+            )
+        entries[key] = {"seen_on": seen_on, "sources": sources}
+    return SeenMemory(entries)
+
+
+def _memory_payload(memory: SeenMemory) -> dict:
+    keys = sorted(memory.entries)
+    return {
+        "seen_keys": keys,
+        "seen_on": {key: str(memory.entries[key].get("seen_on") or "") for key in keys},
+        "seen_sources": {
+            key: list(memory.entries[key].get("sources") or [])
+            for key in keys
+            if memory.entries[key].get("sources")
+        },
+    }
+
+
+def load_seen_memory(path: str | Path) -> SeenMemory:
+    """The seen file, including dates. A missing file means nothing yet.
 
     A broken file is renamed aside and this run starts with an empty memory,
     so one bad file cannot stop the search or wipe the old bytes in place.
     """
     file_path = Path(path)
     if not file_path.exists():
-        return set()
+        return SeenMemory()
     try:
         data = json.loads(file_path.read_text(encoding="utf-8"))
-        return _seen_keys(data)
+        return _memory_from_data(data, file_path)
     except (json.JSONDecodeError, ValueError, TypeError, AttributeError):
         dest = _rename_corrupt(file_path)
         print(
@@ -103,7 +230,12 @@ def load_seen(path: str | Path) -> set[str]:
             "This run will treat every listing as new.",
             flush=True,
         )
-        return set()
+        return SeenMemory()
+
+
+def load_seen(path: str | Path) -> set[str]:
+    """Keys saved recently. A missing or expired file contributes nothing."""
+    return load_seen_memory(path).active_keys(date.today())
 
 
 def _seen_keys(data: object) -> set[str]:
@@ -128,10 +260,27 @@ def _rename_corrupt(file_path: Path) -> Path:
     return dest
 
 
-def save_seen(path: str | Path, keys: set[str]) -> None:
+def save_seen_memory(path: str | Path, memory: SeenMemory) -> None:
     """Write the memory file. Sorted keys keep the file stable between runs."""
-    payload = {"seen_keys": sorted(keys)}
-    _write_text_atomic(Path(path), json.dumps(payload, indent=2) + "\n")
+    _write_text_atomic(Path(path), json.dumps(_memory_payload(memory), indent=2) + "\n")
+
+
+def save_seen(path: str | Path, keys: set[str]) -> None:
+    """Write keys that were just seen. Older callers pass a set of strings."""
+    today = date.today().isoformat()
+    memory = SeenMemory({key: {"seen_on": today, "sources": []} for key in keys})
+    save_seen_memory(path, memory)
+
+
+def note_source_attempt(log: dict | None, name: str, *, failed: bool) -> None:
+    """Count one search against a source. ``log`` is None in older callers."""
+    if log is None:
+        return
+    label = str(name or "").strip() or "unknown"
+    bucket = log.setdefault(label, {"attempts": 0, "failed": 0})
+    bucket["attempts"] += 1
+    if failed:
+        bucket["failed"] += 1
 
 
 def _bump(counts: dict[str, dict[str, int]], name: str, is_new: bool) -> None:
@@ -141,11 +290,13 @@ def _bump(counts: dict[str, dict[str, int]], name: str, is_new: bool) -> None:
         bucket["new"] += 1
 
 
-def run_summary(rows: list[dict], run_at) -> dict:
+def run_summary(rows: list[dict], run_at, source_failures: dict | None = None) -> dict:
     """Totals for one run. A job found on two sites is counted under each name.
 
     total_listings is the number of rows, so it can be smaller than the sum
-    of by_source when one row names more than one site.
+    of by_source when one row names more than one site. ``failures`` is
+    added only when the caller counted searches, so older summaries stay
+    the same shape.
     """
     by_source: dict[str, dict[str, int]] = {}
     by_source_type: dict[str, dict[str, int]] = {}
@@ -156,7 +307,7 @@ def run_summary(rows: list[dict], run_at) -> dict:
         names = [part.strip() for part in (row.get("source") or "").split(",") if part.strip()]
         for name in names or ["unknown"]:
             _bump(by_source, name, is_new)
-    return {
+    summary = {
         "run_at": run_at.isoformat(timespec="seconds"),
         "timezone": _timezone_label(run_at),
         "total_listings": len(rows),
@@ -164,14 +315,33 @@ def run_summary(rows: list[dict], run_at) -> dict:
         "by_source": dict(sorted(by_source.items())),
         "by_source_type": dict(sorted(by_source_type.items())),
     }
+    if source_failures is not None:
+        cleaned = {}
+        for name in sorted(source_failures):
+            item = source_failures[name] or {}
+            cleaned[name] = {
+                "attempts": int(item.get("attempts", 0)),
+                "failed": int(item.get("failed", 0)),
+            }
+        summary["failures"] = {
+            "total": sum(item["failed"] for item in cleaned.values()),
+            "by_source": cleaned,
+        }
+    return summary
 
 
-def write_daily_files(rows: list[dict], new_csv_path: str | Path, last_run_path: str | Path, run_at) -> dict:
+def write_daily_files(
+    rows: list[dict],
+    new_csv_path: str | Path,
+    last_run_path: str | Path,
+    run_at,
+    source_failures: dict | None = None,
+) -> dict:
     """Write the new-only spreadsheet and the small JSON summary of this run.
 
     When nothing is new, the CSV still gets the header row.
     """
-    summary = run_summary(rows, run_at)
+    summary = run_summary(rows, run_at, source_failures)
     new_rows = [row for row in rows if row.get("is_new") == "yes"]
     _write_csv(new_rows, Path(new_csv_path))
     _write_text_atomic(Path(last_run_path), json.dumps(summary, indent=2) + "\n")
@@ -325,8 +495,8 @@ def _write_excel(rows: list[dict], path: Path, place_names: list[str] | None = N
     lines = [
         "Each row on the Jobs sheet is one job posting collected by scrape.py.",
         "Open output/shortlist.xlsx and the Top-N sheet for the short list to read first. This Jobs sheet is the full search.",
-        "New since last run is yes when that link was not in data/seen_jobs.json before this run.",
-        "On a first run, every row says yes. Later runs say yes only for postings that were not saved before.",
+        "New since last run is yes when that posting was not saved in data/seen_jobs.json in the last 90 days.",
+        "On a first run, every row says yes. Later runs say yes only for postings that were not saved in that window. A different link on the same site can still be new.",
         "Use the dropdown arrows in the header row to filter. Choose yes to see only the new listings.",
         _place_sentence(place_names),
         "Description is a short snippet, not the full advert. Open the URL for the full posting.",
@@ -338,9 +508,9 @@ def _write_excel(rows: list[dict], path: Path, place_names: list[str] | None = N
         "Visa fit and Language fit use your answers. Sponsorship mentioned is shaded green. A job that says it will not sponsor, that needs a language you did not list, or whose posting is in another language, is shaded red and sorted last. Those rows are removed only when you choose to hide jobs that do not fit.",
         "Source type is company site, job board, remote board, or aggregator. Sort or filter that column to see the less crowded sources first. Company site means the company's own careers page. Job board means a country or startup board.",
         "Ready search links for sites this program does not read are written to output/links.md.",
-        "The same title at the same company is kept once. The company site link is kept when a job board lists it too.",
+        "The same title at the same company on two sites is kept once. Two different links on the same site stay as two rows. The company site link is kept when a board lists the same role.",
         "Data sources: the company career pages and job boards you turned on, including Indeed and LinkedIn when they are enabled. Listings from Remote OK are included under their terms. Credit Remote OK: https://remoteok.com",
-        "Delete data/seen_jobs.json if you want the next run to treat every listing as new again.",
+        "Entries in data/seen_jobs.json older than 90 days are dropped. Delete that file if you want the next run to treat every listing as new again.",
     ]
     for offset, line in enumerate(lines, start=3):
         about.cell(offset, 1, safe_cell(line))

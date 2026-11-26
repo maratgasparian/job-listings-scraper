@@ -1,9 +1,16 @@
 """The shortlist stage. No network."""
 
+from email.message import Message
+from io import BytesIO
+from pathlib import Path
+from urllib.error import HTTPError
+
 from openpyxl import load_workbook
 
+from boards import USER_AGENT
 from scrape import _run_search
 from shortlist import (
+    default_get,
     description_from_html,
     fetch_linkedin_description,
     load_rules,
@@ -492,3 +499,70 @@ country: germany
     workbook = load_workbook(tmp_path / "output" / "shortlist.xlsx")
     assert "Top-N" in workbook.sheetnames
     assert workbook["Top-N"]["C2"].value
+
+
+def test_default_get_uses_the_project_user_agent(monkeypatch):
+    source = (Path(__file__).resolve().parents[1] / "shortlist.py").read_text(encoding="utf-8")
+    requirements = (Path(__file__).resolve().parents[1] / "requirements.txt").read_text(encoding="utf-8")
+    assert "curl_cffi" not in source
+    assert "impersonate=" not in source
+    dependencies = [
+        line.strip()
+        for line in requirements.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    assert not any("curl" in line.lower() for line in dependencies)
+
+    class Body:
+        status = 200
+
+        def read(self, _limit=-1):
+            return b"<p>Hello</p>"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    seen = {}
+
+    def urlopen(request, timeout=20, context=None):
+        seen["timeout"] = timeout
+        seen["ua"] = request.get_header("User-agent")
+        seen["context"] = context
+        return Body()
+
+    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+    status, body = default_get("https://www.linkedin.com/jobs/view/1")
+    assert status == 200
+    assert body == "<p>Hello</p>"
+    assert seen["timeout"] == 20
+    assert seen["ua"] == USER_AGENT
+    assert "Chrome" not in seen["ua"]
+    assert seen["context"] is not None
+
+    def forbidden(_request, timeout=20, context=None):
+        raise HTTPError(
+            "https://www.linkedin.com/jobs/view/1",
+            403,
+            "Forbidden",
+            Message(),
+            BytesIO(b"nope"),
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", forbidden)
+    status, body = default_get("https://www.linkedin.com/jobs/view/1")
+    assert status == 403
+    assert body == "nope"
+
+    def timed_out(_request, timeout=20, context=None):
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr("urllib.request.urlopen", timed_out)
+    try:
+        default_get("https://www.linkedin.com/jobs/view/1")
+    except TimeoutError:
+        pass
+    else:
+        raise AssertionError("a timeout should be raised for the caller to retry")

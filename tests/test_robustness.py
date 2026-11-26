@@ -177,6 +177,50 @@ def test_offline_run_keeps_previous_results(tmp_path, capsys):
     assert list((tmp_path / "data").glob("*.tmp")) == []
 
 
+def test_last_run_records_which_source_failed(tmp_path):
+    config = _write_config(
+        tmp_path,
+        """
+roles: [Designer]
+locations:
+  - name: Berlin, Germany
+    indeed_location: Berlin, Germany
+    linkedin_location: Berlin, Germany
+sources:
+  - id: indeed
+    enabled: true
+    kind: aggregator
+  - id: linkedin
+    enabled: true
+    kind: aggregator
+country: germany
+results_per_search: 5
+posted_within_days: 7
+pause_seconds: 1
+output:
+  directory: output
+  csv: jobs.csv
+  excel: jobs.xlsx
+  seen_file: data/seen_jobs.json
+""",
+    )
+
+    def fetch(_role, _place, site):
+        if site == "linkedin":
+            raise RuntimeError("linkedin refused")
+        return [_row(title="Kept role", url="https://example.com/kept")]
+
+    code = _run_search(config, fetch=fetch, getter=lambda _url: b"{}")
+    assert code == 0
+    saved = json.loads((tmp_path / "output" / "last_run.json").read_text(encoding="utf-8"))
+    assert saved["total_listings"] >= 1
+    assert saved["new_listings"] >= 1
+    assert "by_source" in saved
+    assert saved["failures"]["by_source"]["linkedin"] == {"attempts": 1, "failed": 1}
+    assert saved["failures"]["by_source"]["indeed"] == {"attempts": 1, "failed": 0}
+    assert saved["failures"]["total"] == 1
+
+
 def test_a_single_successful_source_still_saves(tmp_path, capsys):
     config = _search_config(tmp_path, remote=True)
 

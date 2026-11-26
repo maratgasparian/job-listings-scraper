@@ -6,6 +6,7 @@ drops duplicate links, and decides which rows are new.
 
 from __future__ import annotations
 
+import html
 import re
 from urllib.parse import parse_qsl, urlsplit, urlunsplit, urlencode
 
@@ -72,16 +73,22 @@ def clean_text(value: object) -> str:
     return text
 
 
+# A real tag, or a comment. "5 < 10" is a comparison, not a tag.
+_HTML_TAG = re.compile(r"(?is)<!--.*?-->|</?[a-z][a-z0-9]*\b[^<>]*>")
+
+
 def snippet(value: object, limit: int = 280) -> str:
     """A short plain-text preview of a job description.
 
     Job sites send HTML or Markdown. Excel is easier to scan when that
-    is flattened to one paragraph and cut on a word boundary.
+    is flattened to one paragraph and cut on a word boundary. Entities
+    such as ``&amp;`` are decoded. A comparison such as ``5 < 10`` is kept.
     """
     text = clean_text(value)
     if not text:
         return ""
-    text = re.sub(r"(?is)<[^>]+>", " ", text)
+    text = html.unescape(text)
+    text = _HTML_TAG.sub(" ", text)
     text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
     text = text.replace("**", "").replace("__", "")
     text = re.sub(r"\s+", " ", text).strip()
@@ -140,9 +147,11 @@ def normalize_url(url: object) -> str:
 
 
 # Least crowded source wins when the same role is posted in more than one place.
+# The same names as config.KNOWN_SOURCES and boards.py. "job board" used to be
+# stored here as "startup board", so those rows lost to Indeed and LinkedIn.
 SOURCE_RANK = {
     "company site": 0,
-    "startup board": 1,
+    "job board": 1,
     "remote board": 2,
     "aggregator": 3,
 }
@@ -311,43 +320,108 @@ def _merge_rows(current: dict, incoming: dict) -> dict:
     return merged
 
 
+def source_names(row: dict) -> set[str]:
+    """Site names on a row, folded, so "Indeed" and "indeed" are one source."""
+    return {
+        part.strip().casefold()
+        for part in str(row.get("source") or "").split(",")
+        if part.strip()
+    }
+
+
+def _url_identity(row: dict) -> set[str]:
+    found = set()
+    for key in row.get("_keys") or []:
+        if str(key).startswith("url:"):
+            found.add(str(key))
+    url = normalize_url(row.get("url") or row.get("job_url"))
+    if url:
+        found.add("url:" + url)
+    return found
+
+
+def _merge_same_role(current: dict, incoming: dict) -> bool:
+    """True when two rows are one posting, not two links on the same site.
+
+    Indeed and LinkedIn use different URLs for the same role, so those still
+    merge. Two Indeed URLs with the same title do not.
+    """
+    current_urls = _url_identity(current)
+    incoming_urls = _url_identity(incoming)
+    if current_urls and incoming_urls and current_urls.isdisjoint(incoming_urls):
+        current_sources = source_names(current)
+        incoming_sources = source_names(incoming)
+        if current_sources and incoming_sources and incoming_sources <= current_sources:
+            return False
+    return True
+
+
+def _index_kept(by_url: dict, by_role: dict, by_text: dict, row: dict, index: int) -> None:
+    urls = _url_identity(row)
+    for url in urls:
+        by_url[url] = index
+    role = title_company_key(row)
+    if role:
+        bucket = by_role.setdefault(role, [])
+        if index not in bucket:
+            bucket.append(index)
+    elif not urls:
+        by_text[listing_key(row)] = index
+
+
 def dedupe(rows: list[dict]) -> list[dict]:
-    """Keep one row per link, and one row per title + company + city.
+    """Keep one row per link, and merge the same role across different sites.
 
     The same posting is often found by more than one role, and the same
     role is often listed on Indeed and on the company's own site. The
     company site is kept when both exist, because that is where you apply.
-    The same title at the same company in another city stays its own row.
+    Two different links on the same site stay as two rows. The same title
+    at the same company in another city stays its own row.
     """
     kept: list[dict] = []
-    position: dict[str, int] = {}
+    by_url: dict[str, int] = {}
+    by_role: dict[str, list[int]] = {}
+    by_text: dict[str, int] = {}
     for row in rows:
-        keys = identity_keys(row)
-        found = next((position[key] for key in keys if key in position), None)
+        urls = _url_identity(row)
+        role = title_company_key(row)
+        found = next((by_url[url] for url in urls if url in by_url), None)
+        if found is None and role:
+            for index in by_role.get(role, []):
+                if _merge_same_role(kept[index], row):
+                    found = index
+                    break
+        if found is None and not urls and not role:
+            found = by_text.get(listing_key(row))
         if found is not None:
             kept[found] = _merge_rows(kept[found], row)
-            for key in identity_keys(kept[found]):
-                position[key] = found
+            _index_kept(by_url, by_role, by_text, kept[found], found)
             continue
         stored = dict(row)
-        stored["_keys"] = keys
+        stored["_keys"] = identity_keys(stored)
         index = len(kept)
         kept.append(stored)
-        for key in keys:
-            position[key] = index
+        _index_kept(by_url, by_role, by_text, stored, index)
     return kept
 
 
-def apply_new_flags(rows: list[dict], seen: set[str]) -> list[dict]:
+def apply_new_flags(rows: list[dict], seen, today=None) -> list[dict]:
     """Mark rows that were not saved on an earlier run.
 
-    A row is not new when its link was saved before, or when the same
-    title and company were saved from another site.
+    A set of keys keeps the previous check: a shared link, or the same
+    title and company, means the row is not new. A seen-file memory
+    forgets keys past its expiry window, and a different link on the
+    same site can still be new.
     """
     flagged = []
+    remember = getattr(seen, "row_was_seen", None)
     for row in rows:
         updated = dict(row)
-        updated["is_new"] = "no" if identity_keys(updated) & seen else "yes"
+        if remember is not None:
+            already = remember(updated, today)
+        else:
+            already = bool(identity_keys(updated) & seen)
+        updated["is_new"] = "no" if already else "yes"
         flagged.append(updated)
     return flagged
 

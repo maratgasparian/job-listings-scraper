@@ -1,13 +1,16 @@
 """Ask Indeed and LinkedIn for listings, through python-jobspy.
 
 python-jobspy reads public search pages. It does not log in, and this
-project does not try to get around a block. If a site says no, the
-search is skipped and the other sites are still saved.
+project does not try to get around a block or pretend to be another
+browser. If a site says no, the search is skipped and the other sites
+are still saved. A missing LinkedIn description is read later with the
+User-Agent from boards.py.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 import time
 
 from jobspy import scrape_jobs
@@ -21,25 +24,27 @@ from regions import country_from_places
 # A block or a login wall is not retried. A proxy miss, a timeout, or a
 # "too many requests" reply is a temporary failure, so the same search is
 # tried again after a pause. Nothing here switches proxies or tries to
-# look like a different browser.
-_STOP_WORDS = (
+# look like a different browser. Status codes are whole numbers, so a
+# timeout of 4031 ms is not treated as HTTP 403.
+_STOP_PHRASES = (
     "blocked",
     "captcha",
     "forbidden",
     "access denied",
-    "403",
-    "401",
     "login required",
 )
-_TRANSIENT_WORDS = (
-    ("429", "too many requests"),
+_STOP_STATUS = re.compile(r"\b(?:401|403)\b")
+_TRANSIENT_STATUS = (
+    (re.compile(r"\b429\b"), "too many requests"),
+    (re.compile(r"\b502\b"), "the site was busy"),
+    (re.compile(r"\b503\b"), "the site was busy"),
+    (re.compile(r"\b504\b"), "the site was busy"),
+)
+_TRANSIENT_PHRASES = (
     ("too many requests", "too many requests"),
     ("proxy", "proxy error"),
     ("timed out", "timeout"),
     ("timeout", "timeout"),
-    ("502", "the site was busy"),
-    ("503", "the site was busy"),
-    ("504", "the site was busy"),
     ("bad gateway", "the site was busy"),
     ("service unavailable", "the site was busy"),
     ("connection reset", "connection problem"),
@@ -52,9 +57,12 @@ _TRANSIENT_WORDS = (
 def transient_reason(exc: BaseException) -> str | None:
     """A short reason to try again, or None when the search should be skipped."""
     text = f"{type(exc).__name__} {exc}".casefold()
-    if any(word in text for word in _STOP_WORDS):
+    if _STOP_STATUS.search(text) or any(word in text for word in _STOP_PHRASES):
         return None
-    for needle, reason in _TRANSIENT_WORDS:
+    for pattern, reason in _TRANSIENT_STATUS:
+        if pattern.search(text):
+            return reason
+    for needle, reason in _TRANSIENT_PHRASES:
         if needle in text:
             return reason
     return None

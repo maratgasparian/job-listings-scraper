@@ -1,13 +1,23 @@
 """Tests for the CSV, Excel file, and the memory of listings already seen."""
 
 import json
-from datetime import datetime
+import os
+import time
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from openpyxl import load_workbook
 
-from listings import listing_key
-from save_results import load_seen, save_seen, write_daily_files, write_outputs
+from listings import identity_keys, listing_key
+from save_results import (
+    SEEN_TTL_DAYS,
+    SeenMemory,
+    load_seen,
+    save_seen,
+    save_seen_memory,
+    write_daily_files,
+    write_outputs,
+)
 
 
 def _row(**overrides):
@@ -185,3 +195,64 @@ def test_seen_file_round_trip(tmp_path):
     save_seen(path, {listing_key(row)})
     assert load_seen(path) == {listing_key(row)}
     assert load_seen(tmp_path / "missing.json") == set()
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["seen_keys"] == [listing_key(row)]
+    assert listing_key(row) in saved["seen_on"]
+
+
+def test_last_run_records_per_source_failures_and_keeps_existing_fields(tmp_path):
+    when = datetime(2026, 10, 22, 16, 5, tzinfo=ZoneInfo("Europe/Rome"))
+    summary = write_daily_files(
+        [_row(is_new="yes")],
+        tmp_path / "new_jobs.csv",
+        tmp_path / "last_run.json",
+        when,
+        source_failures={
+            "indeed": {"attempts": 2, "failed": 0},
+            "linkedin": {"attempts": 2, "failed": 1},
+        },
+    )
+    saved = json.loads((tmp_path / "last_run.json").read_text(encoding="utf-8"))
+    assert saved["run_at"] == "2026-10-22T16:05:00+02:00"
+    assert saved["timezone"] == "Europe/Rome"
+    assert saved["total_listings"] == 1
+    assert saved["new_listings"] == 1
+    assert saved["by_source"]["indeed"] == {"total": 1, "new": 1}
+    assert saved["by_source_type"]["aggregator"] == {"total": 1, "new": 1}
+    assert saved["failures"] == {
+        "total": 1,
+        "by_source": {
+            "indeed": {"attempts": 2, "failed": 0},
+            "linkedin": {"attempts": 2, "failed": 1},
+        },
+    }
+    assert summary["failures"]["total"] == 1
+
+
+def test_old_seen_file_still_loads_and_expired_entries_are_dropped(tmp_path):
+    path = tmp_path / "seen_jobs.json"
+    path.write_text('{"seen_keys": ["url:https://example.com/a"]}\n', encoding="utf-8")
+    assert load_seen(path) == {"url:https://example.com/a"}
+
+    stale = time.time() - (SEEN_TTL_DAYS + 30) * 86400
+    os.utime(path, (stale, stale))
+    assert load_seen(path) == set()
+
+    today = date(2026, 11, 26)
+    fresh = (today - timedelta(days=3)).isoformat()
+    old = (today - timedelta(days=SEEN_TTL_DAYS + 1)).isoformat()
+    row = _row()
+    memory = SeenMemory(
+        {
+            "url:https://example.com/old": {"seen_on": old, "sources": ["indeed"]},
+            "url:https://example.com/recent": {"seen_on": fresh, "sources": ["indeed"]},
+        }
+    )
+    memory.remember([row], today)
+    save_seen_memory(path, memory)
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert "url:https://example.com/old" not in saved["seen_keys"]
+    assert "url:https://example.com/recent" in saved["seen_keys"]
+    assert listing_key(row) in saved["seen_keys"]
+    assert identity_keys(row) <= set(saved["seen_keys"])
+    assert saved["seen_on"][listing_key(row)] == today.isoformat()

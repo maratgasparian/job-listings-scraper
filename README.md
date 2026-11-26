@@ -38,7 +38,7 @@ You answer the questions, or edit `config.yaml`. The program asks Indeed, Linked
 
 This program is for your own job search.
 
-Indeed and LinkedIn's terms of service do not allow automated scraping. Use it for yourself, leave the pause between requests in place, and stop if a site tells you to. The program does not log in and does not try to get past a block. You are responsible for following each site's terms.
+Indeed and LinkedIn's terms of service do not allow automated scraping. Use it for yourself, leave the pause between requests in place, and stop if a site tells you to. The program does not log in, does not pretend to be another browser, and does not try to get past a block. Public pages are requested with the User-Agent `job-listings-scraper`. You are responsible for following each site's terms.
 
 Remote boards are read from their public feeds. When a result comes from Remote OK, credit Remote OK and link to [https://remoteok.com](https://remoteok.com). Their API asks for that attribution. The Excel file's About sheet includes the same credit.
 
@@ -401,7 +401,7 @@ To run the search every day, follow [docs/scheduling.md](docs/scheduling.md). Th
 
 - `data/seen_jobs.json` — listings already collected
 - `output/new_jobs.csv` — only the rows that are new (header only when nothing is new)
-- `output/last_run.json` — the time on your computer (or the `timezone` in config.yaml), totals, and a count per source
+- `output/last_run.json` — the time on your computer (or the `timezone` in config.yaml), totals, a count per source, and how many searches failed per source
 
 Those files stay on your computer. Git ignores them.
 
@@ -492,9 +492,9 @@ Files:
 - `output/new_jobs.csv` — new rows only
 - `output/last_run.json` — counts for the latest run
 
-On a first run, every row says **yes**. Later runs say **yes** only for jobs that were not in `data/seen_jobs.json`. Delete that file to treat every current job as new again.
+On a first run, every row says **yes**. Later runs say **yes** only for jobs that were not saved in `data/seen_jobs.json` in the last 90 days. Delete that file to treat every current job as new again.
 
-The same title at the same company is kept once. The company-site link wins when a board lists it too. A job found on two sites is counted under both names in `last_run.json`. `total_listings` is the number of rows.
+The same title at the same company in one city is kept once when it is listed on two sites. Two different links on the same site stay as two rows. The company-site link wins when a board lists the same role. A job found on two sites is counted under both names in `last_run.json`. `total_listings` is the number of rows. `failures` records how many searches failed for each source.
 
 ## Project structure
 
@@ -528,7 +528,7 @@ sample/             Made-up spreadsheet, so you can see the columns before you s
 
 - Some boards block automated requests. startup.jobs and EU-Startups answered with a bot check when this was built. Headless requests to Welcome to the Jungle were blocked as well. Those sources are not included. If Indeed or LinkedIn refuses a request, that search is skipped and the rest are still saved.
 - LinkedIn's public search cannot force "remote only", so a few office jobs in the country you set can appear in the Remote rows. Read the Location column.
-- Company pages and remote boards are kept when the office matches a city you listed, or when the role is remote and open in your country or the regions in `location_filter`. An office in another city is left out. A remote role limited to a different country is left out.
+- Company pages, remote boards, and Indeed/LinkedIn follow the same country rule. An office in another city is left out. A remote role that names a different country is left out, including a remote search. A posting that only says Remote, or a region you included such as Europe, EU, or Worldwide, is kept.
 - We Work Remotely is read from the all-jobs feed unless you set `categories` on that source. The title filter still applies, so an unusual profession mostly comes from Indeed and LinkedIn.
 - An unusual title is dropped until you add a phrase under `title_keywords`. "Product Manager" and "Senior Product Manager" stay as two rows.
 - Descriptions are shortened. Open the link for the full advert. Some company pages, notably Workable, send no description. Language and visa notes are guessed from that text before it is shortened.
