@@ -27,6 +27,7 @@ from html import unescape
 from urllib.parse import urlparse
 
 from config import Company, Settings
+from save_results import note_source_attempt
 from enrichment import describe_posting, job_type_text, passes_filters
 from environment import certificate_hint, network_problem, report_skip
 from matching import normalise
@@ -912,6 +913,7 @@ def collect_company_pages(
     sleep=time.sleep,
     clock=None,
     roles=None,
+    failure_log=None,
 ) -> tuple[list[dict], int]:
     """Read company career pages on a few threads, without crowding one host.
 
@@ -949,11 +951,13 @@ def collect_company_pages(
         jobs, exc = results[id(company)]
         if exc is not None:
             failures += 1
+            note_source_attempt(failure_log, f"{company.name} careers", failed=True)
             if _blocked_or_missing(exc):
                 blocked.append(company.name)
             else:
                 report_skip(exc)
             continue
+        note_source_attempt(failure_log, f"{company.name} careers", failed=False)
         kept.extend(
             filter_board_jobs(jobs, settings, "company site", curated=company.curated)
         )
@@ -967,7 +971,12 @@ def collect_company_pages(
     return kept, failures
 
 
-def collect_board_listings(settings: Settings, pause=time.sleep, getter=http_get) -> tuple[list[dict], int]:
+def collect_board_listings(
+    settings: Settings,
+    pause=time.sleep,
+    getter=http_get,
+    failure_log=None,
+) -> tuple[list[dict], int]:
     """Fetch every enabled company page and remote board.
 
     Returns the kept rows and how many feeds failed.
@@ -988,6 +997,7 @@ def collect_board_listings(settings: Settings, pause=time.sleep, getter=http_get
                 settings,
                 sleep=pause,
                 roles=settings.roles,
+                failure_log=failure_log,
             )
             rows.extend(found)
             failures += failed
@@ -1006,9 +1016,11 @@ def collect_board_listings(settings: Settings, pause=time.sleep, getter=http_get
                 )
             except Exception as exc:
                 failures += 1
+                note_source_attempt(failure_log, source_id.replace("_", " "), failed=True)
                 report_skip(exc)
                 found = []
             else:
+                note_source_attempt(failure_log, source_id.replace("_", " "), failed=False)
                 print(f"  Kept {len(found)} matching listings.", flush=True)
         else:
             source_id = str(target)
@@ -1022,9 +1034,11 @@ def collect_board_listings(settings: Settings, pause=time.sleep, getter=http_get
                 )
             except Exception as exc:
                 failures += 1
+                note_source_attempt(failure_log, source_id.replace("_", " "), failed=True)
                 report_skip(exc)
                 found = []
             else:
+                note_source_attempt(failure_log, source_id.replace("_", " "), failed=False)
                 print(f"  Kept {len(found)} matching listings.", flush=True)
         rows.extend(found)
         if settings.pause_seconds and index != len(steps) - 1:

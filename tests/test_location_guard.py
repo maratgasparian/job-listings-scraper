@@ -83,12 +83,54 @@ def test_aggregator_location_guard(tmp_path, capsys, country, place_name, locati
         assert "1 dropped as another country" in output
 
 
-def test_remote_place_keeps_rows_the_office_guard_would_drop(tmp_path, capsys):
+_REMOTE_GERMANY = [
+    ("Tokyo, Japan", False),
+    ("Austin, TX", False),
+    ("Berlin, Germany", True),
+    ("Remote", True),
+    ("Europe", True),
+    ("EU", True),
+    ("Worldwide", True),
+    ("Remote - US only", False),
+    ("London, United Kingdom", False),
+]
+
+
+@pytest.mark.parametrize(("location", "kept"), _REMOTE_GERMANY)
+def test_remote_germany_keeps_the_country_and_open_regions(tmp_path, capsys, location, kept):
+    settings = _settings(tmp_path, "germany", "Germany", remote=True)
+    settings.places[0].name = "Remote"
+    rows, failures = collect_listings(settings, _fetch(location), pause=lambda _seconds: None)
+    output = capsys.readouterr().out
+    assert failures == 0
+    assert (len(rows) == 1) is kept
+    if kept:
+        assert "dropped as another country" not in output
+    else:
+        assert "1 dropped as another country" in output
+
+
+def test_remote_united_states_drops_europe(tmp_path, capsys):
+    settings = _settings(tmp_path, "usa", "United States", remote=True)
+    settings.places[0].name = "Remote"
+    rows, _failures = collect_listings(
+        settings, _fetch("Europe"), pause=lambda _seconds: None
+    )
+    assert rows == []
+    assert "1 dropped as another country" in capsys.readouterr().out
+    capsys.readouterr()
+    kept, _failures = collect_listings(
+        settings, _fetch("Remote"), pause=lambda _seconds: None
+    )
+    assert len(kept) == 1
+
+
+def test_remote_italy_drops_a_us_state_lookalike(tmp_path, capsys):
     rows, failures = collect_listings(
-        _settings(tmp_path, "italy", "Remote", remote=True),
+        _settings(tmp_path, "italy", "Italy", remote=True),
         _fetch("Milano, TX"),
         pause=lambda _seconds: None,
     )
     assert failures == 0
-    assert len(rows) == 1
-    assert "dropped as another country" not in capsys.readouterr().out
+    assert rows == []
+    assert "1 dropped as another country" in capsys.readouterr().out

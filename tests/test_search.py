@@ -2,7 +2,7 @@
 
 from config import Place, Settings
 from scrape import collect_listings
-from sources import build_search, fetch_listings, take_records
+from sources import build_search, fetch_listings, take_records, transient_reason
 
 
 def _settings(**overrides):
@@ -277,3 +277,42 @@ def test_collect_listings_drops_excluded_words_as_whole_words():
     rows, failures = collect_listings(settings, fetch, pause=lambda _seconds: None)
     assert failures == 0
     assert [row["title"] for row in rows] == ["Internal Product Manager"]
+
+
+def test_a_timeout_measured_in_milliseconds_is_not_an_auth_failure():
+    assert transient_reason(RuntimeError("Read timed out after 4031 ms")) == "timeout"
+    assert transient_reason(RuntimeError("Read timed out after 4010 ms")) == "timeout"
+    assert transient_reason(RuntimeError("HTTP Error 403: Forbidden")) is None
+    assert transient_reason(RuntimeError("401 Unauthorized")) is None
+    assert transient_reason(RuntimeError("429 Too Many Requests")) == "too many requests"
+
+
+def test_collect_listings_counts_failures_per_site():
+    settings = _settings(pause_seconds=0)
+    settings.places = settings.places[:1]
+    log: dict = {}
+
+    def fetch(_role, place, site):
+        if site == "linkedin":
+            raise RuntimeError("linkedin down")
+        return [
+            {
+                "title": "Product Manager",
+                "company": "ACME",
+                "location": place.name,
+                "date_posted": "2026-10-20",
+                "source": site,
+                "url": "https://example.com/indeed/1",
+                "description": "",
+                "role_searched": "Product Manager",
+                "place_searched": place.name,
+            }
+        ]
+
+    rows, failures = collect_listings(
+        settings, fetch, pause=lambda _seconds: None, failure_log=log
+    )
+    assert failures == 1
+    assert len(rows) == 1
+    assert log["linkedin"] == {"attempts": 1, "failed": 1}
+    assert log["indeed"] == {"attempts": 1, "failed": 0}

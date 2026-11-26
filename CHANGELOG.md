@@ -26,6 +26,13 @@
 
 ### Fixed
 
+- A remote Indeed or LinkedIn search drops a posting that names another country. A posting that says Remote, or an allowed region such as Europe or Worldwide, is kept.
+- A job board outranks Indeed and LinkedIn when the same role is listed on both. The source type is `job board`.
+- LinkedIn description fetches send the project's User-Agent. They do not impersonate a browser. `curl_cffi` is not required.
+- A timeout such as "4031 ms" is retried. HTTP 401 and 403 are still not retried.
+- Job snippets decode HTML entities and keep comparisons such as `5 < 10`.
+- `output/last_run.json` records how many searches failed for each source.
+- Two different links on the same site stay as two rows. The same role on Indeed and LinkedIn is still one row. Entries in `data/seen_jobs.json` older than 90 days are forgotten.
 - GitHub Actions can import the project modules when it runs `pytest -q`. `pythonpath = ["."]` in `pyproject.toml` puts the repo root on the import path.
 - The setup wizard names the launcher for this computer: `start.bat` on Windows, `start.command` on macOS, and `start.sh` on Linux. Tests read the executable bit of `start.sh` and `start.command` from the mode git recorded, so that check works on Windows too.
 

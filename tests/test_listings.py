@@ -1,6 +1,6 @@
 """Tests for cleaning, deduplicating, and flagging job listings."""
 
-from datetime import date
+from datetime import date, timedelta
 
 import pytest
 
@@ -11,6 +11,7 @@ from listings import (
     company_name_key,
     dedupe,
     excluded_region,
+    identity_keys,
     listing_key,
     normalize_url,
     roles_for_title,
@@ -21,6 +22,7 @@ from listings import (
     title_is_relevant,
 )
 from regions import build_location_rules, canonical_country
+from save_results import SEEN_TTL_DAYS, SeenMemory
 
 
 def test_snippet_strips_html_and_collapses_whitespace():
@@ -42,6 +44,14 @@ def test_snippet_of_empty_values_is_blank():
     assert snippet(None, 50) == ""
     assert snippet("   ", 50) == ""
     assert snippet(float("nan"), 50) == ""
+
+
+def test_snippet_decodes_entities_and_keeps_comparisons():
+    assert snippet("Fish &amp; Chips", 80) == "Fish & Chips"
+    assert snippet("Hello&nbsp;there", 80) == "Hello there"
+    assert snippet("5 < 10 and 20 > 15", 80) == "5 < 10 and 20 > 15"
+    assert snippet("<p>5 &lt; 10 and 20 &gt; 15</p>", 80) == "5 < 10 and 20 > 15"
+    assert snippet("<b>Fish &amp; Chips</b>", 80) == "Fish & Chips"
 
 
 def test_row_from_hit_maps_jobspy_fields():
@@ -434,6 +444,74 @@ def test_same_job_from_indeed_and_linkedin_in_one_city_merges():
     assert "linkedin" in kept[0]["source"]
 
 
+def test_dedupe_keeps_distinct_urls_from_the_same_source():
+    first = "https://de.indeed.com/viewjob?jk=1"
+    second = "https://de.indeed.com/viewjob?jk=2"
+    rows = [
+        _job("Software Engineer", "Deutsche Bank", "Frankfurt, Germany", first, "indeed"),
+        _job("Software Engineer", "Deutsche Bank", "Frankfurt, Germany", second, "indeed"),
+    ]
+    kept = dedupe(rows)
+    assert len(kept) == 2
+    assert {row["url"] for row in kept} == {first, second}
+
+
+def test_dedupe_still_merges_the_same_role_across_sources():
+    rows = [
+        _job(
+            "Software Engineer",
+            "Deutsche Bank",
+            "Frankfurt, Germany",
+            "https://de.indeed.com/viewjob?jk=1",
+            "indeed",
+        ),
+        _job(
+            "Software Engineer",
+            "Deutsche Bank",
+            "Frankfurt",
+            "https://www.linkedin.com/jobs/view/99",
+            "linkedin",
+        ),
+    ]
+    kept = dedupe(rows)
+    assert len(kept) == 1
+    assert "indeed" in kept[0]["source"]
+    assert "linkedin" in kept[0]["source"]
+    extra = _job(
+        "Software Engineer",
+        "Deutsche Bank",
+        "Frankfurt, Germany",
+        "https://de.indeed.com/viewjob?jk=3",
+        "indeed",
+    )
+    assert len(dedupe(rows + [extra])) == 2
+
+
+def test_job_board_beats_an_aggregator_for_the_same_role():
+    indeed = _job(
+        "Software Engineer",
+        "Deutsche Bank",
+        "Frankfurt, Germany",
+        "https://de.indeed.com/viewjob?jk=1",
+        "indeed",
+    )
+    board = _job(
+        "Software Engineer",
+        "Deutsche Bank",
+        "Frankfurt, Germany",
+        "https://www.arbeitnow.com/jobs/1",
+        "arbeitnow",
+    )
+    board["source_type"] = "job board"
+    kept = dedupe([indeed, board])
+    assert len(kept) == 1
+    assert kept[0]["source_type"] == "job board"
+    assert kept[0]["url"] == board["url"]
+    reversed_rows = dedupe([board, indeed])
+    assert reversed_rows[0]["source_type"] == "job board"
+    assert reversed_rows[0]["url"] == board["url"]
+
+
 def test_sort_puts_new_jobs_first_and_newest_dates_above_older_ones():
     rows = [
         {"is_new": "no", "date_posted": "2026-10-20", "title": "old-recent"},
@@ -443,3 +521,54 @@ def test_sort_puts_new_jobs_first_and_newest_dates_above_older_ones():
     ]
     titles = [row["title"] for row in sort_rows(rows)]
     assert titles == ["new-newer", "new-older", "new-undated", "old-recent"]
+
+
+def _memory(row, seen_on, sources):
+    return SeenMemory(
+        {key: {"seen_on": seen_on, "sources": sources} for key in identity_keys(row)}
+    )
+
+
+def test_same_source_with_a_new_url_stays_new_and_another_site_does_not():
+    today = date(2026, 11, 26)
+    seen_on = (today - timedelta(days=10)).isoformat()
+    indeed = _job(
+        "Software Engineer",
+        "Deutsche Bank",
+        "Frankfurt, Germany",
+        "https://de.indeed.com/viewjob?jk=1",
+        "indeed",
+    )
+    other_indeed = _job(
+        "Software Engineer",
+        "Deutsche Bank",
+        "Frankfurt, Germany",
+        "https://de.indeed.com/viewjob?jk=2",
+        "indeed",
+    )
+    linkedin = _job(
+        "Software Engineer",
+        "Deutsche Bank",
+        "Frankfurt, Germany",
+        "https://www.linkedin.com/jobs/view/9",
+        "linkedin",
+    )
+    memory = _memory(indeed, seen_on, ["indeed"])
+    assert apply_new_flags([indeed], memory, today=today)[0]["is_new"] == "no"
+    assert apply_new_flags([other_indeed], memory, today=today)[0]["is_new"] == "yes"
+    assert apply_new_flags([linkedin], memory, today=today)[0]["is_new"] == "no"
+
+
+def test_a_seen_job_is_new_again_after_the_expiry_window():
+    today = date(2026, 11, 26)
+    row = _job(
+        "Software Engineer",
+        "Deutsche Bank",
+        "Frankfurt, Germany",
+        "https://de.indeed.com/viewjob?jk=1",
+        "indeed",
+    )
+    fresh = (today - timedelta(days=SEEN_TTL_DAYS)).isoformat()
+    stale = (today - timedelta(days=SEEN_TTL_DAYS + 1)).isoformat()
+    assert apply_new_flags([row], _memory(row, fresh, ["indeed"]), today=today)[0]["is_new"] == "no"
+    assert apply_new_flags([row], _memory(row, stale, ["indeed"]), today=today)[0]["is_new"] == "yes"

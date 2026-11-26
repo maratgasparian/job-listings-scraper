@@ -1,5 +1,7 @@
 # Libraries the scraper needs. Install with:
 #     pip install -r requirements.txt
+# HTTP calls use the Python standard library and the User-Agent in boards.py.
+# curl_cffi is not a dependency. The scraper does not impersonate a browser.
 python-jobspy==1.4.0
 PyYAML==6.0.3
 openpyxl==3.1.5

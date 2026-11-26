@@ -9,6 +9,8 @@ pages. When the same role at the same company has a longer description from
 another site, that text is used for the years and language checks, and the
 reason says so. LinkedIn descriptions that are still missing are read from
 the public job page, one at a time, with a pause, and stored in a cache.
+That request sends the project's own User-Agent. It does not pretend to be
+another browser.
 """
 
 from __future__ import annotations
@@ -997,16 +999,37 @@ def _status_reason(status: int) -> str | None:
 
 
 def default_get(url: str) -> tuple[int, str]:
-    """One polite request to a public LinkedIn page. No login and no proxy list."""
-    from curl_cffi import requests as cfreq
+    """One polite request to a public LinkedIn page.
 
-    response = cfreq.get(
+    No login, no proxy list, and no browser impersonation. The User-Agent
+    is the same one boards.py sends. A 4xx or 5xx comes back as a status
+    code so the caller can decide whether to retry. A timeout still raises.
+    """
+    import urllib.error
+    import urllib.request
+
+    from boards import USER_AGENT, _ssl_context
+
+    request = urllib.request.Request(
         url,
-        timeout=20,
-        impersonate="chrome",
-        headers={"Accept-Language": "en-US,en;q=0.9"},
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
     )
-    return int(response.status_code), response.text or ""
+    try:
+        with urllib.request.urlopen(request, timeout=20, context=_ssl_context()) as response:
+            raw = response.read(2_000_000)
+            code = int(response.status)
+    except urllib.error.HTTPError as exc:
+        raw = exc.read(2_000_000) if exc.fp is not None else b""
+        code = int(exc.code)
+    if isinstance(raw, str):
+        text = raw
+    else:
+        text = (raw or b"").decode("utf-8", errors="replace")
+    return code, text
 
 
 def load_cache(path: Path) -> dict:
